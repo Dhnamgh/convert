@@ -1,45 +1,38 @@
-# Equation Converter (Word/PDF → Word with Native Equations)
+# CONVERT FILE AND DATA (Streamlit App)
 
-A Streamlit app with **password login** that converts:
-- **Word → Word**: DOCX containing LaTeX-like math (e.g., `([ ... ])`, `$...$`, `$$...$$`) into a DOCX with **native Word equations** (OMML) via Pandoc.
-- **PDF → Word**: Best-effort conversion via Pandoc. (True equation recovery from arbitrary PDFs is not guaranteed.)
+- **Login bằng mật khẩu** (env `APP_PASSWORD`), có Logout.
+- Sidebar trái = menu; nội dung hiển thị bên phải.
+- Footer giữa cuối trang: “bản quyền thuộc về TS DHN”.
 
-## Features
-- Login required (password from environment variable `APP_PASSWORD`).
-- Two tabs:
-  - **Word → Word**: Converts LaTeX-like math to native equations.
-  - **PDF → Word**: Uses Pandoc PDF reader (quality depends on the PDF source).
-- Download the converted DOCX.
+## Chức năng
+### 1) Word → Word
+- **Giữ nguyên** các phương trình Word (OMML) sẵn có trong file.
+- Tự động **chuyển** các *đoạn nguyên dòng* viết theo dạng `([ ... ])` thành **phương trình hiển thị** (DisplayMath).
+- Không đụng phần chữ khác → không mất ký hiệu.
+- Pipeline: **DOCX —(Lua filter)→ DOCX** (KHÔNG qua Markdown).
 
-## How it works (Word → Word)
-1. DOCX is parsed for text.
-2. Custom blocks `([ ... ])` are normalized to `$$ ... $$` (display math).
-3. Existing `$...$` and `$$...$$` are kept as-is.
-4. Text is converted to Markdown and then to Word via **Pandoc** (which renders equations as OMML).
+### 2) PDF → Word (best-effort)
+- Dùng Pandoc để chuyển PDF sang DOCX. Khả năng phục hồi equation phụ thuộc file PDF nguồn.
 
-## Requirements
-- Python 3.8+
-- `pip install -r requirements.txt`
-- **Pandoc** installed and on PATH (see https://pandoc.org/installing.html)
-
-## Run locally
+## Chạy local
 ```bash
-export APP_PASSWORD="your_password_here"
+pip install -r requirements.txt
+export APP_PASSWORD="your_password"      # macOS/Linux
+# Windows PowerShell: $env:APP_PASSWORD="your_password"
 streamlit run app.py
 ```
 
-On Windows PowerShell:
-```powershell
-$env:APP_PASSWORD="your_password_here"
-streamlit run app.py
-```
+> Nếu máy không có Pandoc và pypandoc không tải được do chặn mạng, cài thủ công từ https://pandoc.org.
+> Trên Streamlit Cloud: thêm file `packages.txt` với nội dung:
+> ```
+> pandoc
+> ```
 
-## Deploy to Streamlit Cloud / GitHub
-1. Push these files to a GitHub repo.
-2. In Streamlit Cloud, set a secret or environment variable `APP_PASSWORD`.
-3. Deploy the app (entry point `app.py`).
+## Deploy Streamlit Cloud (qua GitHub)
+- Repo cần có `app.py`, `requirements.txt`, (khuyến nghị) `packages.txt`.
+- Trong Settings của app: đặt biến môi trường `APP_PASSWORD`.
+- Deploy, login bằng mật khẩu, sử dụng các chức năng.
 
-## Notes on PDF → Word
-- Converting arbitrary PDFs to **native** Word equations is fundamentally hard.
-- The app uses Pandoc to extract text; equations will be improved **only if** the PDF has extractable math text or LaTeX-like patterns.
-- For guaranteed fidelity, start from DOCX with LaTeX math or original LaTeX sources.
+## Lưu ý soạn công thức
+- Các khối `([ ... ])` nên chứa **LaTeX math đúng chuẩn** (ví dụ: `\rho`, `\nabla`, `\frac{...}{...}`).
+- Các equation Word sẵn có trong file sẽ được **giữ nguyên**.

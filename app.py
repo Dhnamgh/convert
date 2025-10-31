@@ -53,17 +53,18 @@ def logout_button():
         st.rerun()
 
 # ---------------- Pandoc helpers ----------------
-def run_pandoc(pandoc_bin: str, args: list, input_bytes: bytes | None = None) -> tuple[int, str, str]:
-    """Run pandoc (absolute path) and return (returncode, stdout, stderr)."""
+def run_pandoc_abs(pandoc_bin: str, args: list, input_text: str | None = None) -> tuple[int, str, str]:
+    """Run pandoc with absolute path. Return (rc, stdout, stderr)."""
     proc = subprocess.Popen(
         [pandoc_bin] + args,
-        stdin=subprocess.PIPE if input_bytes is not None else None,
+        stdin=subprocess.PIPE if input_text is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
     )
-    out, err = proc.communicate(input_bytes.decode("utf-8") if input_bytes is not None else None)
-    return proc.returncode, out, err
+    out, err = proc.communicate(input_text if input_text is not None else None)
+    rc = proc.returncode
+    return rc, out, err
 
 @st.cache_resource(show_spinner=False)
 def ensure_pandoc_cached() -> tuple[str, str]:
@@ -95,64 +96,78 @@ def ensure_pandoc_cached() -> tuple[str, str]:
             f"Chi tiết: {e}"
         )
 
-# ---------------- Math normalization ----------------
-def normalize_docx_math_with_pandoc_to_md(pandoc_bin: str, docx_bytes: bytes) -> str:
+# ---------------- Lua filter for markers ([ ... ]) ----------------
+CONVERT_MARKERS_LUA = r'''
+-- convert_markers.lua
+-- Change lines of the form: ([ ... ])  -->  Display Math (OMML)
+-- Keep existing Word equations (OMML) intact.
+
+local utils = require('pandoc.utils')
+
+function Para(el)
+  local s = utils.stringify(el)
+  local inner = s:match("^%(%[%s*(.-)%s*%]%)$")
+  if inner then
+    return pandoc.Para({ pandoc.Math('DisplayMath', inner) })
+  end
+  return nil
+end
+'''
+
+def convert_docx_docx_with_lua(pandoc_bin: str, docx_bytes: bytes, title: str = "", author: str = "") -> bytes:
     """
-    DOCX (có equation OMML và/hoặc text LaTeX) -> Markdown với $...$/$$...$$ (giữ toán).
-    Dùng pandoc docx->md để KHÔNG mất phương trình.
+    DOCX → DOCX, using Lua filter:
+    - Preserve existing OMML equations,
+    - Convert '([ ... ])' full-line blocks into DisplayMath,
+    - Do not touch other text.
     """
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-        tmp.write(docx_bytes)
-        tmp.flush()
-        in_path = tmp.name
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as out:
-            out_path = out.name
-        rc, out_txt, err_txt = run_pandoc(pandoc_bin, [
-            in_path,
-            "-t", "markdown+tex_math_dollars",
-            "-o", out_path
-        ])
+    with tempfile.TemporaryDirectory() as td:
+        in_path  = os.path.join(td, "in.docx")
+        out_path = os.path.join(td, "out.docx")
+        lua_path = os.path.join(td, "convert_markers.lua")
+
+        with open(in_path, "wb") as f:
+            f.write(docx_bytes)
+        with open(lua_path, "w", encoding="utf-8") as f:
+            f.write(CONVERT_MARKERS_LUA)
+
+        args = [in_path, "-o", out_path, "--lua-filter", lua_path]
+        rc, out_txt, err_txt = run_pandoc_abs(pandoc_bin, args)
         if rc != 0:
-            raise RuntimeError(f"Pandoc docx->md lỗi:\nSTDERR:\n{err_txt}\nSTDOUT:\n{out_txt}")
-        md = open(out_path, "r", encoding="utf-8").read()
-        return md
+            raise RuntimeError(
+                "Pandoc error (DOCX→DOCX with Lua filter).\n"
+                f"Command: {' '.join([pandoc_bin] + args)}\n"
+                f"STDOUT:\n{out_txt}\n"
+                f"STDERR:\n{err_txt}\n"
+            )
+        with open(out_path, "rb") as f:
+            return f.read()
+
+def pdf_to_docx(pandoc_bin: str, pdf_bytes: bytes) -> bytes:
+    """PDF → DOCX (best-effort) via pandoc."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmpin:
+        tmpin.write(pdf_bytes)
+        tmpin.flush()
+        in_path = tmpin.name
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpout:
+            out_path = tmpout.name
+        rc, out_txt, err_txt = run_pandoc_abs(pandoc_bin, [in_path, "-o", out_path])
+        if rc != 0:
+            raise RuntimeError(
+                "Pandoc error (PDF→DOCX).\n"
+                f"Command: {' '.join([pandoc_bin, in_path, '-o', out_path])}\n"
+                f"STDOUT:\n{out_txt}\n"
+                f"STDERR:\n{err_txt}\n"
+            )
+        with open(out_path, "rb") as f:
+            data = f.read()
+        try: os.remove(out_path)
+        except: pass
+        return data
     finally:
         try: os.remove(in_path)
         except: pass
-        try: os.remove(out_path)
-        except: pass
-
-def apply_custom_math_markers(md_text: str) -> str:
-    """
-    Chuyển các khối '([ ... ])' -> $$ ... $$ trong Markdown (sau khi đã docx->md).
-    """
-    s = md_text.replace("\r\n", "\n")
-    pattern_block = re.compile(r"\(\[\s*(.*?)\s*\]\)", re.DOTALL)
-    s = re.sub(pattern_block, lambda m: r"$$\n" + m.group(1).strip() + r"\n$$", s)
-    # đảm bảo khoảng trống quanh display math
-    s = re.sub(r"\s*\$\$\s*\n", "\n\n$$\n", s)
-    s = re.sub(r"\n\s*\$\$\s*", "\n$$\n\n", s)
-    return s
-
-def markdown_to_docx_with_pandoc(pandoc_bin: str, md_text: str) -> bytes:
-    """
-    Markdown (chứa $...$ / $$...$$) -> DOCX (equation OMML) bằng Pandoc.
-    """
-    with tempfile.TemporaryDirectory() as td:
-        md_path = os.path.join(td, "input.md")
-        out_path = os.path.join(td, "output.docx")
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(md_text)
-        rc, out_txt, err_txt = run_pandoc(pandoc_bin, [
-            md_path,
-            "-f", "markdown+tex_math_dollars",
-            "-t", "docx",
-            "-o", out_path
-        ])
-        if rc != 0:
-            raise RuntimeError(f"Pandoc md->docx lỗi:\nSTDERR:\n{err_txt}\nSTDOUT:\n{out_txt}")
-        return open(out_path, "rb").read()
 
 # ---------------- UI blocks ----------------
 def page_header():
@@ -161,8 +176,7 @@ def page_header():
 
 def word_to_word_ui():
     st.subheader("DOCX (văn bản + mã công thức) → DOCX (phương trình Word/OMML)")
-    st.write("Hỗ trợ: phương trình Word có sẵn **vẫn giữ nguyên**; mã công thức dạng `([ ... ])`, `$...$`, `$$...$$` sẽ được chuyển thành equation.")
-
+    st.write("Giữ nguyên equation Word có sẵn; chuyển các đoạn nguyên dòng dạng `([ ... ])` thành phương trình hiển thị.")
     with st.form("form_docx", clear_on_submit=False):
         up = st.file_uploader("Tải lên DOCX", type=["docx"], key="docx_up")
         c1, c2 = st.columns(2)
@@ -180,26 +194,9 @@ def word_to_word_ui():
             with st.spinner("Đang chuyển đổi..."):
                 pandoc_bin, ver = ensure_pandoc_cached()
                 st.info(f"Pandoc: {ver} ({pandoc_bin})")
-
-                # 1) DOCX -> Markdown (giữ equation thành $...$/$$...$$)
-                md = normalize_docx_math_with_pandoc_to_md(pandoc_bin, up.getvalue())
-
-                # 2) Áp dụng quy tắc đổi '([ ... ])' -> '$$...$$'
-                md = apply_custom_math_markers(md)
-
-                # 2.5) Thêm header nếu có
-                header = []
-                if title:
-                    header.append(f"# {title}\n")
-                if author:
-                    header.append(f"**{author}**\n")
-                if header:
-                    md = "\n".join(header) + "\n" + md
-
-                # 3) Markdown -> DOCX (equation OMML)
-                out_bytes = markdown_to_docx_with_pandoc(pandoc_bin, md)
-
-            st.success("Chuyển đổi thành công (giữ nguyên equation, chuyển mã công thức).")
+                raw_docx = up.getvalue()
+                out_bytes = convert_docx_docx_with_lua(pandoc_bin, raw_docx, title, author)
+            st.success("Chuyển đổi thành công.")
             st.download_button(
                 "Tải DOCX",
                 data=out_bytes,
@@ -212,8 +209,7 @@ def word_to_word_ui():
 
 def pdf_to_word_ui():
     st.subheader("PDF → DOCX (best-effort)")
-    st.write("Pandoc sẽ cố gắng trích text và công thức; kết quả phụ thuộc PDF nguồn (không đảm bảo 100% equation).")
-
+    st.write("Pandoc cố gắng trích text và công thức; kết quả phụ thuộc PDF nguồn (không đảm bảo 100%).")
     with st.form("form_pdf", clear_on_submit=False):
         up = st.file_uploader("Tải lên PDF", type=["pdf"], key="pdf_up")
         submitted = st.form_submit_button("Convert PDF → Word")
@@ -226,25 +222,7 @@ def pdf_to_word_ui():
             with st.spinner("Đang chuyển đổi..."):
                 pandoc_bin, ver = ensure_pandoc_cached()
                 st.info(f"Pandoc: {ver} ({pandoc_bin})")
-
-                # PDF -> DOCX trực tiếp qua pandoc
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmpin:
-                    tmpin.write(up.getvalue())
-                    tmpin.flush()
-                    in_path = tmpin.name
-                try:
-                    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpout:
-                        out_path = tmpout.name
-                    rc, out_txt, err_txt = run_pandoc(pandoc_bin, [in_path, "-o", out_path])
-                    if rc != 0:
-                        raise RuntimeError(f"Pandoc pdf->docx lỗi:\nSTDERR:\n{err_txt}\nSTDOUT:\n{out_txt}")
-                    out_bytes = open(out_path, "rb").read()
-                finally:
-                    try: os.remove(in_path)
-                    except: pass
-                    try: os.remove(out_path)
-                    except: pass
-
+                out_bytes = pdf_to_docx(pandoc_bin, up.getvalue())
             st.success("Chuyển đổi thành công.")
             st.download_button(
                 "Tải DOCX",
@@ -261,9 +239,8 @@ def main_app():
     st.sidebar.write("---")
     nav = st.sidebar.radio("Chức năng", ["Word → Word", "PDF → Word"], index=0)
     logout_button()
-    st.markdown(f"## {APP_TITLE}")
-    st.write("---")
 
+    page_header()
     if nav == "Word → Word":
         word_to_word_ui()
     else:
