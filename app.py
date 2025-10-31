@@ -1,25 +1,39 @@
 # app.py
 import os
-import io
 import re
 import tempfile
 import subprocess
 import streamlit as st
-
 from docx import Document
 
 # ====================== CONFIG & CONSTANTS ======================
 APP_TITLE = "CONVERT FILE AND DATA"
 PASSWORD_ENV = "APP_PASSWORD"  # đặt mật khẩu qua biến môi trường
 
-# Quan trọng: đặt page_config TRƯỚC mọi output UI
+# Đặt page_config TRƯỚC mọi output UI
 st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="wide")
 
+# ====================== GLOBAL STYLES (FOOTER) ======================
+FOOTER_HTML = """
+<style>
+/* Footer sticky bottom center */
+#custom-footer {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 0.5rem;
+  color: rgba(49, 51, 63, 0.6);
+  font-size: 0.9rem;
+  z-index: 1000;
+}
+</style>
+<div id="custom-footer">bản quyền thuộc về <strong>TS DHN</strong></div>
+"""
+st.markdown(FOOTER_HTML, unsafe_allow_html=True)
 
 # ====================== AUTH ======================
 def login_view():
     st.markdown(f"## {APP_TITLE}")
-    st.markdown("_bản quyền thuộc về **TS DHN**_")
     st.write("---")
     st.title("🔐 Login")
     st.write("Nhập mật khẩu để truy cập ứng dụng.")
@@ -31,17 +45,15 @@ def login_view():
             return
         if pwd == real:
             st.session_state.authenticated = True
-            st.rerun()  # thay cho st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Mật khẩu không đúng.")
-
 
 def logout_button():
     st.sidebar.markdown("### 🔐 Session")
     if st.sidebar.button("Logout"):
         st.session_state.authenticated = False
         st.rerun()
-
 
 # ====================== UTILS ======================
 def normalize_quotes(s: str) -> str:
@@ -50,7 +62,6 @@ def normalize_quotes(s: str) -> str:
              .replace('—', '---')
              .replace('“', '"').replace('”', '"')
              .replace("’", "'"))
-
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
     """Đọc DOCX -> chuỗi text (để tìm & chuyển các marker công thức)."""
@@ -71,7 +82,6 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
         except Exception:
             pass
 
-
 def to_markdown_with_math(src_text: str) -> str:
     """
     Chuẩn hóa các marker công thức sang LaTeX math để Pandoc chuyển thành OMML:
@@ -87,15 +97,19 @@ def to_markdown_with_math(src_text: str) -> str:
     s = re.sub(r"\n\s*\$\$\s*", "\n$$\n\n", s)
     return s
 
-
 def ensure_pandoc() -> str:
-    """Kiểm tra Pandoc trong PATH."""
+    """Kiểm tra Pandoc trong PATH. Trả về phiên bản nếu OK, raise nếu thiếu."""
     try:
         out = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
         return out.splitlines()[0]
     except Exception as e:
-        raise RuntimeError("Pandoc chưa cài hoặc không có trong PATH. Cài từ https://pandoc.org/installing.html")
-
+        raise RuntimeError(
+            "Pandoc chưa cài hoặc không có trong PATH.\n"
+            "- Local (macOS): brew install pandoc\n"
+            "- Local (Ubuntu/Debian): sudo apt-get install -y pandoc\n"
+            "- Windows: cài từ pandoc.org\n"
+            "- Streamlit Cloud: thêm file packages.txt chứa một dòng: pandoc"
+        )
 
 def md_to_docx(md_text: str) -> bytes:
     """Markdown (có LaTeX math) -> DOCX (OMML) qua Pandoc."""
@@ -109,7 +123,6 @@ def md_to_docx(md_text: str) -> bytes:
         subprocess.check_call(cmd)
         with open(out_path, "rb") as f:
             return f.read()
-
 
 def pdf_to_docx(pdf_bytes: bytes) -> bytes:
     """
@@ -140,14 +153,10 @@ def pdf_to_docx(pdf_bytes: bytes) -> bytes:
         except Exception:
             pass
 
-
 # ====================== MAIN UI ======================
 def page_header():
-    # Tiêu đề trên cùng bên phải
     st.markdown(f"## {APP_TITLE}")
-    st.markdown("_bản quyền thuộc về **TS DHN**_")
     st.write("---")
-
 
 def word_to_word_ui():
     st.subheader("DOCX (văn bản + mã công thức) → DOCX (phương trình Word/OMML)")
@@ -159,13 +168,19 @@ def word_to_word_ui():
     with c2:
         author = st.text_input("Tác giả (tuỳ chọn)", "")
 
-    if st.button("Convert Word → Word", type="primary") and up:
+    if st.button("Convert Word → Word", type="primary"):
+        if not up:
+            st.warning("Hãy tải lên một file DOCX trước.")
+            return
         try:
+            # Kiểm tra pandoc trước khi xử lý
+            ver = ensure_pandoc()
+            st.info(f"Pandoc phát hiện: {ver}")
+
             raw = up.read()
             text = extract_text_from_docx(raw)
             md = to_markdown_with_math(text)
 
-            # Thêm header vào Markdown nếu người dùng nhập
             header = []
             if title:
                 header.append(f"# {title}\n")
@@ -185,7 +200,6 @@ def word_to_word_ui():
         except Exception as e:
             st.error(f"Lỗi: {e}")
 
-
 def pdf_to_word_ui():
     st.subheader("PDF → DOCX (best-effort)")
     st.write("Dùng Pandoc để trích văn bản; việc khôi phục phương trình thành OMML **không đảm bảo** cho mọi PDF.")
@@ -194,25 +208,26 @@ def pdf_to_word_ui():
     if st.button("Convert PDF → Word"):
         if not up:
             st.warning("Hãy tải lên một file PDF trước.")
-        else:
-            try:
-                pdf_bytes = up.read()
-                out_bytes = pdf_to_docx(pdf_bytes)
-                st.success("Chuyển đổi thành công.")
-                st.download_button(
-                    "Tải DOCX",
-                    data=out_bytes,
-                    file_name="converted_from_pdf.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-            except Exception as e:
-                st.error(f"Lỗi: {e}")
+            return
+        try:
+            ver = ensure_pandoc()
+            st.info(f"Pandoc phát hiện: {ver}")
 
+            pdf_bytes = up.read()
+            out_bytes = pdf_to_docx(pdf_bytes)
+            st.success("Chuyển đổi thành công.")
+            st.download_button(
+                "Tải DOCX",
+                data=out_bytes,
+                file_name="converted_from_pdf.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
 
 def main_app():
     # Sidebar = Tabs (bên trái)
     st.sidebar.markdown(f"### {APP_TITLE}")
-    st.sidebar.caption("bản quyền thuộc về TS DHN")
     st.sidebar.write("---")
 
     nav = st.sidebar.radio(
@@ -234,17 +249,12 @@ def main_app():
     else:
         pdf_to_word_ui()
 
-
 # ====================== APP ENTRY ======================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
+    # Chỉ hiển thị login, không hiển thị sidebar/tabs
     login_view()
 else:
-    try:
-        # Kiểm tra pandoc sớm để báo lỗi rõ ràng
-        _v = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
-    except Exception:
-        st.warning("⚠️ Pandoc chưa cài hoặc không có trong PATH. Hãy cài đặt từ https://pandoc.org/installing.html")
     main_app()
