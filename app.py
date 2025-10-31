@@ -5,7 +5,6 @@ import sys
 import tempfile
 import subprocess
 import streamlit as st
-from docx import Document
 
 APP_TITLE = "CONVERT FILE AND DATA"
 PASSWORD_ENV = "APP_PASSWORD"  # set this env var to enable login
@@ -53,59 +52,18 @@ def logout_button():
         st.session_state.authenticated = False
         st.rerun()
 
-# ---------------- UTILITIES ----------------
-def normalize_quotes(s: str) -> str:
-    return (s.replace('\xa0', ' ')
-             .replace('–', '--')
-             .replace('—', '---')
-             .replace('“', '"').replace('”', '"')
-             .replace("’", "'"))
-
-def extract_text_from_docx(file_bytes: bytes) -> str:
-    """Read DOCX -> plain text (paragraph-joined) for math normalization."""
-    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        tmp_path = tmp.name
-    try:
-        from docx import Document as _Doc
-        doc = _Doc(tmp_path)
-        parts = []
-        for p in doc.paragraphs:
-            txt = "".join(run.text for run in p.runs)
-            parts.append(txt.strip())
-        return "\n\n".join([normalize_quotes(p) for p in parts if p is not None])
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-def to_markdown_with_math(src_text: str) -> str:
-    """
-    Normalize custom math markers into LaTeX math for Pandoc:
-      - Block '([ ... ])'  --> $$ ... $$
-      - Keep inline $...$ and display $$...$$ as-is.
-    """
-    s = src_text.replace("\r\n", "\n")
-    pattern_block = re.compile(r"\(\[\s*(.*?)\s*\]\)", re.DOTALL)
-    s = re.sub(pattern_block, lambda m: r"$$\n" + m.group(1).strip() + r"\n$$", s)
-    # ensure spacing around display math for pandoc
-    s = re.sub(r"\s*\$\$\s*\n", "\n\n$$\n", s)
-    s = re.sub(r"\n\s*\$\$\s*", "\n$$\n\n", s)
-    return s
-
-def run_pandoc(pandoc_bin: str, cmd_args: list) -> None:
-    """Run pandoc with full stderr/stdout capture for better error messages."""
-    cmd = [pandoc_bin] + cmd_args
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "Pandoc error.\n"
-            f"Command: {' '.join(cmd)}\n"
-            f"STDOUT:\n{proc.stdout}\n"
-            f"STDERR:\n{proc.stderr}\n"
-        )
+# ---------------- Pandoc helpers ----------------
+def run_pandoc(pandoc_bin: str, args: list, input_bytes: bytes | None = None) -> tuple[int, str, str]:
+    """Run pandoc (absolute path) and return (returncode, stdout, stderr)."""
+    proc = subprocess.Popen(
+        [pandoc_bin] + args,
+        stdin=subprocess.PIPE if input_bytes is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    out, err = proc.communicate(input_bytes.decode("utf-8") if input_bytes is not None else None)
+    return proc.returncode, out, err
 
 @st.cache_resource(show_spinner=False)
 def ensure_pandoc_cached() -> tuple[str, str]:
@@ -114,7 +72,6 @@ def ensure_pandoc_cached() -> tuple[str, str]:
     Strategy:
       1) Try 'pandoc' from PATH
       2) Else use pypandoc.download_pandoc() and pypandoc.get_pandoc_path()
-      3) If still fail, raise with instructions
     """
     # 1) Try existing in PATH
     try:
@@ -126,63 +83,85 @@ def ensure_pandoc_cached() -> tuple[str, str]:
     # 2) Try pypandoc managed binary (absolute path)
     try:
         import pypandoc
-        # Download if missing
         pypandoc.download_pandoc()
-        pandoc_path = pypandoc.get_pandoc_path()  # absolute path to binary
-        # sanity check
+        pandoc_path = pypandoc.get_pandoc_path()
         out = subprocess.check_output([pandoc_path, "--version"], stderr=subprocess.STDOUT, text=True)
         return (pandoc_path, out.splitlines()[0])
     except Exception as e:
         raise RuntimeError(
             "Pandoc chưa sẵn sàng và không thể tải tự động (có thể do môi trường chặn mạng).\n"
-            "Cách cài thủ công khi deploy Cloud: thêm file `packages.txt` với nội dung chỉ một dòng: `pandoc`.\n"
+            "Cách cài thủ công khi deploy Cloud: thêm file `packages.txt` với nội dung: `pandoc`.\n"
             "Local: cài pandoc theo hệ điều hành (brew/apt/installer).\n"
             f"Chi tiết: {e}"
         )
 
-def md_to_docx(md_text: str) -> bytes:
-    """Markdown (with LaTeX math) -> DOCX (OMML equations) via Pandoc."""
-    pandoc_bin, _ver = ensure_pandoc_cached()
+# ---------------- Math normalization ----------------
+def normalize_docx_math_with_pandoc_to_md(pandoc_bin: str, docx_bytes: bytes) -> str:
+    """
+    DOCX (có equation OMML và/hoặc text LaTeX) -> Markdown với $...$/$$...$$ (giữ toán).
+    Dùng pandoc docx->md để KHÔNG mất phương trình.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        tmp.write(docx_bytes)
+        tmp.flush()
+        in_path = tmp.name
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as out:
+            out_path = out.name
+        rc, out_txt, err_txt = run_pandoc(pandoc_bin, [
+            in_path,
+            "-t", "markdown+tex_math_dollars",
+            "-o", out_path
+        ])
+        if rc != 0:
+            raise RuntimeError(f"Pandoc docx->md lỗi:\nSTDERR:\n{err_txt}\nSTDOUT:\n{out_txt}")
+        md = open(out_path, "r", encoding="utf-8").read()
+        return md
+    finally:
+        try: os.remove(in_path)
+        except: pass
+        try: os.remove(out_path)
+        except: pass
+
+def apply_custom_math_markers(md_text: str) -> str:
+    """
+    Chuyển các khối '([ ... ])' -> $$ ... $$ trong Markdown (sau khi đã docx->md).
+    """
+    s = md_text.replace("\r\n", "\n")
+    pattern_block = re.compile(r"\(\[\s*(.*?)\s*\]\)", re.DOTALL)
+    s = re.sub(pattern_block, lambda m: r"$$\n" + m.group(1).strip() + r"\n$$", s)
+    # đảm bảo khoảng trống quanh display math
+    s = re.sub(r"\s*\$\$\s*\n", "\n\n$$\n", s)
+    s = re.sub(r"\n\s*\$\$\s*", "\n$$\n\n", s)
+    return s
+
+def markdown_to_docx_with_pandoc(pandoc_bin: str, md_text: str) -> bytes:
+    """
+    Markdown (chứa $...$ / $$...$$) -> DOCX (equation OMML) bằng Pandoc.
+    """
     with tempfile.TemporaryDirectory() as td:
         md_path = os.path.join(td, "input.md")
         out_path = os.path.join(td, "output.docx")
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_text)
-        run_pandoc(pandoc_bin, [md_path, "-o", out_path, "--from", "markdown+tex_math_dollars", "--to", "docx"])
-        with open(out_path, "rb") as f:
-            return f.read()
+        rc, out_txt, err_txt = run_pandoc(pandoc_bin, [
+            md_path,
+            "-f", "markdown+tex_math_dollars",
+            "-t", "docx",
+            "-o", out_path
+        ])
+        if rc != 0:
+            raise RuntimeError(f"Pandoc md->docx lỗi:\nSTDERR:\n{err_txt}\nSTDOUT:\n{out_txt}")
+        return open(out_path, "rb").read()
 
-def pdf_to_docx(pdf_bytes: bytes) -> bytes:
-    """
-    PDF -> DOCX (best-effort) via Pandoc.
-    Native equation recovery is not guaranteed for arbitrary PDFs.
-    """
-    pandoc_bin, _ver = ensure_pandoc_cached()
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmpin:
-        tmpin.write(pdf_bytes)
-        tmpin.flush()
-        in_path = tmpin.name
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpout:
-            out_path = tmpout.name
-        run_pandoc(pandoc_bin, [in_path, "-o", out_path])
-        with open(out_path, "rb") as f:
-            data = f.read()
-        try: os.remove(out_path)
-        except Exception: pass
-        return data
-    finally:
-        try: os.remove(in_path)
-        except Exception: pass
-
-# ---------------- UI ----------------
+# ---------------- UI blocks ----------------
 def page_header():
     st.markdown(f"## {APP_TITLE}")
     st.write("---")
 
 def word_to_word_ui():
     st.subheader("DOCX (văn bản + mã công thức) → DOCX (phương trình Word/OMML)")
-    st.write("Hỗ trợ marker công thức: `([ ... ])`, `$...$`, `$$...$$`.")
+    st.write("Hỗ trợ: phương trình Word có sẵn **vẫn giữ nguyên**; mã công thức dạng `([ ... ])`, `$...$`, `$$...$$` sẽ được chuyển thành equation.")
 
     with st.form("form_docx", clear_on_submit=False):
         up = st.file_uploader("Tải lên DOCX", type=["docx"], key="docx_up")
@@ -201,9 +180,14 @@ def word_to_word_ui():
             with st.spinner("Đang chuyển đổi..."):
                 pandoc_bin, ver = ensure_pandoc_cached()
                 st.info(f"Pandoc: {ver} ({pandoc_bin})")
-                raw = up.getvalue()
-                text = extract_text_from_docx(raw)
-                md = to_markdown_with_math(text)
+
+                # 1) DOCX -> Markdown (giữ equation thành $...$/$$...$$)
+                md = normalize_docx_math_with_pandoc_to_md(pandoc_bin, up.getvalue())
+
+                # 2) Áp dụng quy tắc đổi '([ ... ])' -> '$$...$$'
+                md = apply_custom_math_markers(md)
+
+                # 2.5) Thêm header nếu có
                 header = []
                 if title:
                     header.append(f"# {title}\n")
@@ -211,8 +195,11 @@ def word_to_word_ui():
                     header.append(f"**{author}**\n")
                 if header:
                     md = "\n".join(header) + "\n" + md
-                out_bytes = md_to_docx(md)
-            st.success("Chuyển đổi thành công.")
+
+                # 3) Markdown -> DOCX (equation OMML)
+                out_bytes = markdown_to_docx_with_pandoc(pandoc_bin, md)
+
+            st.success("Chuyển đổi thành công (giữ nguyên equation, chuyển mã công thức).")
             st.download_button(
                 "Tải DOCX",
                 data=out_bytes,
@@ -225,7 +212,7 @@ def word_to_word_ui():
 
 def pdf_to_word_ui():
     st.subheader("PDF → DOCX (best-effort)")
-    st.write("Dùng Pandoc để trích văn bản; việc khôi phục phương trình thành OMML **không đảm bảo** cho mọi PDF.")
+    st.write("Pandoc sẽ cố gắng trích text và công thức; kết quả phụ thuộc PDF nguồn (không đảm bảo 100% equation).")
 
     with st.form("form_pdf", clear_on_submit=False):
         up = st.file_uploader("Tải lên PDF", type=["pdf"], key="pdf_up")
@@ -239,8 +226,25 @@ def pdf_to_word_ui():
             with st.spinner("Đang chuyển đổi..."):
                 pandoc_bin, ver = ensure_pandoc_cached()
                 st.info(f"Pandoc: {ver} ({pandoc_bin})")
-                pdf_bytes = up.getvalue()
-                out_bytes = pdf_to_docx(pdf_bytes)
+
+                # PDF -> DOCX trực tiếp qua pandoc
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmpin:
+                    tmpin.write(up.getvalue())
+                    tmpin.flush()
+                    in_path = tmpin.name
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpout:
+                        out_path = tmpout.name
+                    rc, out_txt, err_txt = run_pandoc(pandoc_bin, [in_path, "-o", out_path])
+                    if rc != 0:
+                        raise RuntimeError(f"Pandoc pdf->docx lỗi:\nSTDERR:\n{err_txt}\nSTDOUT:\n{out_txt}")
+                    out_bytes = open(out_path, "rb").read()
+                finally:
+                    try: os.remove(in_path)
+                    except: pass
+                    try: os.remove(out_path)
+                    except: pass
+
             st.success("Chuyển đổi thành công.")
             st.download_button(
                 "Tải DOCX",
@@ -257,8 +261,9 @@ def main_app():
     st.sidebar.write("---")
     nav = st.sidebar.radio("Chức năng", ["Word → Word", "PDF → Word"], index=0)
     logout_button()
+    st.markdown(f"## {APP_TITLE}")
+    st.write("---")
 
-    page_header()
     if nav == "Word → Word":
         word_to_word_ui()
     else:
