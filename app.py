@@ -1,3 +1,4 @@
+# app.py
 import os
 import io
 import re
@@ -7,31 +8,42 @@ import streamlit as st
 
 from docx import Document
 
-APP_TITLE = "Equation Converter (Word/PDF → Word with Native Equations)"
-PASSWORD_ENV = "APP_PASSWORD"  # Set this in your deployment environment
+# ====================== CONFIG & CONSTANTS ======================
+APP_TITLE = "CONVERT FILE AND DATA"
+PASSWORD_ENV = "APP_PASSWORD"  # đặt mật khẩu qua biến môi trường
 
-# ----------------------- Authentication -----------------------
+# Quan trọng: đặt page_config TRƯỚC mọi output UI
+st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="wide")
+
+
+# ====================== AUTH ======================
 def login_view():
+    st.markdown(f"## {APP_TITLE}")
+    st.markdown("_bản quyền thuộc về **TS DHN**_")
+    st.write("---")
     st.title("🔐 Login")
-    st.write("Enter password to access the converter.")
+    st.write("Nhập mật khẩu để truy cập ứng dụng.")
     pwd = st.text_input("Password", type="password")
     if st.button("Login"):
         real = os.environ.get(PASSWORD_ENV, "").strip()
         if not real:
-            st.error("Server misconfiguration: APP_PASSWORD is not set.")
+            st.error("Server chưa cấu hình `APP_PASSWORD`. Vui lòng đặt biến môi trường trước khi chạy.")
             return
         if pwd == real:
             st.session_state.authenticated = True
-            st.experimental_rerun()
+            st.rerun()  # thay cho st.experimental_rerun()
         else:
-            st.error("Incorrect password.")
+            st.error("Mật khẩu không đúng.")
+
 
 def logout_button():
+    st.sidebar.markdown("### 🔐 Session")
     if st.sidebar.button("Logout"):
         st.session_state.authenticated = False
-        st.experimental_rerun()
+        st.rerun()
 
-# ----------------------- Utilities ----------------------------
+
+# ====================== UTILS ======================
 def normalize_quotes(s: str) -> str:
     return (s.replace('\xa0', ' ')
              .replace('–', '--')
@@ -39,8 +51,9 @@ def normalize_quotes(s: str) -> str:
              .replace('“', '"').replace('”', '"')
              .replace("’", "'"))
 
+
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    # Read docx and return plain text separated by blank lines
+    """Đọc DOCX -> chuỗi text (để tìm & chuyển các marker công thức)."""
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp.flush()
@@ -53,31 +66,39 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
             parts.append(txt.strip())
         return "\n\n".join([normalize_quotes(p) for p in parts if p is not None])
     finally:
-        try: os.remove(tmp_path)
-        except: pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
 
 def to_markdown_with_math(src_text: str) -> str:
     """
-    Convert custom math markers to LaTeX math for Pandoc.
-    - Block pattern: ([ ... ])  --> $$ ... $$
-    - Keep $...$ and $$...$$ as-is.
+    Chuẩn hóa các marker công thức sang LaTeX math để Pandoc chuyển thành OMML:
+      - Khối '([ ... ])'  --> $$ ... $$
+      - Giữ nguyên inline $...$ và display $$...$$ nếu đã có.
     """
     s = src_text.replace("\r\n", "\n")
+    # Khối nhiều dòng: ([ ... ])
     pattern_block = re.compile(r"\(\[\s*(.*?)\s*\]\)", re.DOTALL)
     s = re.sub(pattern_block, lambda m: r"$$\n" + m.group(1).strip() + r"\n$$", s)
-    # Ensure spacing around display math for Pandoc
+    # Thêm khoảng trắng chuẩn quanh $$ để Pandoc hiểu là display math
     s = re.sub(r"\s*\$\$\s*\n", "\n\n$$\n", s)
     s = re.sub(r"\n\s*\$\$\s*", "\n$$\n\n", s)
     return s
 
+
 def ensure_pandoc() -> str:
+    """Kiểm tra Pandoc trong PATH."""
     try:
         out = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
         return out.splitlines()[0]
     except Exception as e:
-        raise RuntimeError("Pandoc not found. Please install pandoc and ensure it is on PATH.")
+        raise RuntimeError("Pandoc chưa cài hoặc không có trong PATH. Cài từ https://pandoc.org/installing.html")
+
 
 def md_to_docx(md_text: str) -> bytes:
+    """Markdown (có LaTeX math) -> DOCX (OMML) qua Pandoc."""
     ensure_pandoc()
     with tempfile.TemporaryDirectory() as td:
         md_path = os.path.join(td, "input.md")
@@ -89,10 +110,12 @@ def md_to_docx(md_text: str) -> bytes:
         with open(out_path, "rb") as f:
             return f.read()
 
+
 def pdf_to_docx(pdf_bytes: bytes) -> bytes:
     """
-    Best-effort PDF -> DOCX via Pandoc. Equations fidelity depends on PDF source.
-    True native equation recovery is only guaranteed if PDF text contains LaTeX-like math or math text.
+    PDF -> DOCX (best-effort) qua Pandoc.
+    Lưu ý: khôi phục phương trình thành OMML từ PDF không được đảm bảo 100%,
+    tùy thuộc cấu trúc văn bản của PDF nguồn.
     """
     ensure_pandoc()
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmpin:
@@ -106,73 +129,122 @@ def pdf_to_docx(pdf_bytes: bytes) -> bytes:
         subprocess.check_call(cmd)
         with open(out_path, "rb") as f:
             data = f.read()
-        try: os.remove(out_path)
-        except: pass
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
         return data
     finally:
-        try: os.remove(in_path)
-        except: pass
+        try:
+            os.remove(in_path)
+        except Exception:
+            pass
 
-# ----------------------- UI ----------------------------
-def main_app():
-    st.title(APP_TITLE)
-    st.caption("Convert Word/PDF containing LaTeX-like math into Word with native equations.")
 
-    tabs = st.tabs(["Word → Word", "PDF → Word"])
+# ====================== MAIN UI ======================
+def page_header():
+    # Tiêu đề trên cùng bên phải
+    st.markdown(f"## {APP_TITLE}")
+    st.markdown("_bản quyền thuộc về **TS DHN**_")
+    st.write("---")
 
-    with tabs[0]:
-        st.subheader("DOCX (with LaTeX math code) → DOCX (native Word equations)")
-        st.write("Supported math markers: `([ ... ])`, `$...$`, `$$...$$`.")
 
-        up = st.file_uploader("Upload DOCX", type=["docx"], key="docx_up")
-        col1, col2 = st.columns(2)
-        with col1:
-            title = st.text_input("Document Title (optional)", "")
-        with col2:
-            author = st.text_input("Author (optional)", "")
+def word_to_word_ui():
+    st.subheader("DOCX (văn bản + mã công thức) → DOCX (phương trình Word/OMML)")
+    st.write("Hỗ trợ marker công thức: `([ ... ])`, `$...$`, `$$...$$`.")
+    up = st.file_uploader("Tải lên DOCX", type=["docx"], key="docx_up")
+    c1, c2 = st.columns(2)
+    with c1:
+        title = st.text_input("Tiêu đề (tuỳ chọn)", "")
+    with c2:
+        author = st.text_input("Tác giả (tuỳ chọn)", "")
 
-        if st.button("Convert Word → Word", type="primary") and up:
-            try:
-                raw = up.read()
-                text = extract_text_from_docx(raw)
-                md = to_markdown_with_math(text)
+    if st.button("Convert Word → Word", type="primary") and up:
+        try:
+            raw = up.read()
+            text = extract_text_from_docx(raw)
+            md = to_markdown_with_math(text)
 
-                # Prefix title/author if provided
-                if title or author:
-                    header = ""
-                    if title:
-                        header += f"# {title}\n\n"
-                    if author:
-                        header += f"**{author}**\n\n"
-                    md = header + md
+            # Thêm header vào Markdown nếu người dùng nhập
+            header = []
+            if title:
+                header.append(f"# {title}\n")
+            if author:
+                header.append(f"**{author}**\n")
+            if header:
+                md = "\n".join(header) + "\n" + md
 
-                out_bytes = md_to_docx(md)
-                st.success("Conversion done.")
-                st.download_button("Download DOCX", data=out_bytes, file_name="converted_equations.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except Exception as e:
-                st.error(f"Error: {e}")
+            out_bytes = md_to_docx(md)
+            st.success("Chuyển đổi thành công.")
+            st.download_button(
+                "Tải DOCX",
+                data=out_bytes,
+                file_name="converted_equations.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
 
-    with tabs[1]:
-        st.subheader("PDF → DOCX (best-effort)")
-        st.write("This uses Pandoc to extract text and convert to DOCX. Native equation recovery from arbitrary PDFs is **not guaranteed**.")
-        up = st.file_uploader("Upload PDF", type=["pdf"], key="pdf_up")
 
-        if st.button("Convert PDF → Word") and up:
+def pdf_to_word_ui():
+    st.subheader("PDF → DOCX (best-effort)")
+    st.write("Dùng Pandoc để trích văn bản; việc khôi phục phương trình thành OMML **không đảm bảo** cho mọi PDF.")
+    up = st.file_uploader("Tải lên PDF", type=["pdf"], key="pdf_up")
+
+    if st.button("Convert PDF → Word"):
+        if not up:
+            st.warning("Hãy tải lên một file PDF trước.")
+        else:
             try:
                 pdf_bytes = up.read()
                 out_bytes = pdf_to_docx(pdf_bytes)
-                st.success("Conversion done.")
-                st.download_button("Download DOCX", data=out_bytes, file_name="converted_from_pdf.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                st.success("Chuyển đổi thành công.")
+                st.download_button(
+                    "Tải DOCX",
+                    data=out_bytes,
+                    file_name="converted_from_pdf.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Lỗi: {e}")
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="wide")
 
+def main_app():
+    # Sidebar = Tabs (bên trái)
+    st.sidebar.markdown(f"### {APP_TITLE}")
+    st.sidebar.caption("bản quyền thuộc về TS DHN")
+    st.sidebar.write("---")
+
+    nav = st.sidebar.radio(
+        "Chức năng",
+        ["Word → Word", "PDF → Word"],
+        index=0,
+        help="Chọn tác vụ chuyển đổi"
+    )
+
+    # Nút logout trong sidebar
+    logout_button()
+
+    # Header bên phải
+    page_header()
+
+    # Hiển thị trang theo lựa chọn
+    if nav == "Word → Word":
+        word_to_word_ui()
+    else:
+        pdf_to_word_ui()
+
+
+# ====================== APP ENTRY ======================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
     login_view()
 else:
-    logout_button()
+    try:
+        # Kiểm tra pandoc sớm để báo lỗi rõ ràng
+        _v = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
+    except Exception:
+        st.warning("⚠️ Pandoc chưa cài hoặc không có trong PATH. Hãy cài đặt từ https://pandoc.org/installing.html")
     main_app()
