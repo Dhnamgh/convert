@@ -1,22 +1,22 @@
 # app.py
 import os
 import re
+import sys
+import shutil
 import tempfile
 import subprocess
 import streamlit as st
 from docx import Document
 
-# ====================== CONFIG & CONSTANTS ======================
 APP_TITLE = "CONVERT FILE AND DATA"
-PASSWORD_ENV = "APP_PASSWORD"  # đặt mật khẩu qua biến môi trường
+PASSWORD_ENV = "APP_PASSWORD"  # set this env var to enable login
 
-# Đặt page_config TRƯỚC mọi output UI
+# Page config MUST be first UI call
 st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="wide")
 
-# ====================== GLOBAL STYLES (FOOTER) ======================
+# ---------- Sticky footer (center bottom) ----------
 FOOTER_HTML = """
 <style>
-/* Footer sticky bottom center */
 #custom-footer {
   position: fixed;
   left: 50%;
@@ -31,7 +31,7 @@ FOOTER_HTML = """
 """
 st.markdown(FOOTER_HTML, unsafe_allow_html=True)
 
-# ====================== AUTH ======================
+# ---------- Auth ----------
 def login_view():
     st.markdown(f"## {APP_TITLE}")
     st.write("---")
@@ -55,7 +55,59 @@ def logout_button():
         st.session_state.authenticated = False
         st.rerun()
 
-# ====================== UTILS ======================
+# ---------- Pandoc handling ----------
+def ensure_pandoc() -> str:
+    """
+    Ensure pandoc is available. Strategy:
+    1) If 'pandoc' exists in PATH -> return its version line.
+    2) Else try to download via pypandoc and make it available.
+    3) If still not available, raise with clear manual instructions.
+    """
+    # 1) Try existing pandoc
+    try:
+        out = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
+        return out.splitlines()[0]
+    except Exception:
+        pass
+
+    # 2) Try pypandoc download
+    try:
+        import pypandoc
+        pypandoc.download_pandoc()  # downloads and configures a local pandoc
+
+        # After download, try again
+        try:
+            out = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
+            return out.splitlines()[0]
+        except Exception:
+            # attempt to locate common bin dirs
+            candidates = []
+            home = os.path.expanduser("~")
+            candidates += [os.path.join(home, ".local", "bin")]
+            if hasattr(sys, "prefix"):
+                candidates += [os.path.join(sys.prefix, "bin")]
+            for b in [p for p in candidates if p and os.path.isdir(p)]:
+                pbin = os.path.join(b, "pandoc")
+                if os.path.exists(pbin):
+                    os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
+                    try:
+                        out = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
+                        return out.splitlines()[0]
+                    except Exception:
+                        pass
+            raise RuntimeError("Pandoc was downloaded but not detected in PATH.")
+    except Exception as e:
+        raise RuntimeError(
+            "Pandoc chưa sẵn sàng. Thử tự động tải thất bại.\n"
+            "Cách cài thủ công:\n"
+            "- macOS: brew install pandoc\n"
+            "- Ubuntu/Debian: sudo apt-get install -y pandoc\n"
+            "- Windows: tải tại https://pandoc.org/installing.html\n"
+            "- Streamlit Cloud: thêm file packages.txt, nội dung: pandoc\n"
+            f"Chi tiết: {e}"
+        )
+
+# ---------- Utilities ----------
 def normalize_quotes(s: str) -> str:
     return (s.replace('\xa0', ' ')
              .replace('–', '--')
@@ -64,7 +116,7 @@ def normalize_quotes(s: str) -> str:
              .replace("’", "'"))
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    """Đọc DOCX -> chuỗi text (để tìm & chuyển các marker công thức)."""
+    """Read DOCX -> plain text (paragraph-joined) for math normalization."""
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp.flush()
@@ -84,35 +136,20 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 
 def to_markdown_with_math(src_text: str) -> str:
     """
-    Chuẩn hóa các marker công thức sang LaTeX math để Pandoc chuyển thành OMML:
-      - Khối '([ ... ])'  --> $$ ... $$
-      - Giữ nguyên inline $...$ và display $$...$$ nếu đã có.
+    Normalize custom math markers into LaTeX math for Pandoc:
+      - Block '([ ... ])'  --> $$ ... $$
+      - Keep inline $...$ and display $$...$$ as-is.
     """
     s = src_text.replace("\r\n", "\n")
-    # Khối nhiều dòng: ([ ... ])
     pattern_block = re.compile(r"\(\[\s*(.*?)\s*\]\)", re.DOTALL)
     s = re.sub(pattern_block, lambda m: r"$$\n" + m.group(1).strip() + r"\n$$", s)
-    # Thêm khoảng trắng chuẩn quanh $$ để Pandoc hiểu là display math
+    # ensure spacing around display math for pandoc
     s = re.sub(r"\s*\$\$\s*\n", "\n\n$$\n", s)
     s = re.sub(r"\n\s*\$\$\s*", "\n$$\n\n", s)
     return s
 
-def ensure_pandoc() -> str:
-    """Kiểm tra Pandoc trong PATH. Trả về phiên bản nếu OK, raise nếu thiếu."""
-    try:
-        out = subprocess.check_output(["pandoc", "--version"], stderr=subprocess.STDOUT, text=True)
-        return out.splitlines()[0]
-    except Exception as e:
-        raise RuntimeError(
-            "Pandoc chưa cài hoặc không có trong PATH.\n"
-            "- Local (macOS): brew install pandoc\n"
-            "- Local (Ubuntu/Debian): sudo apt-get install -y pandoc\n"
-            "- Windows: cài từ pandoc.org\n"
-            "- Streamlit Cloud: thêm file packages.txt chứa một dòng: pandoc"
-        )
-
 def md_to_docx(md_text: str) -> bytes:
-    """Markdown (có LaTeX math) -> DOCX (OMML) qua Pandoc."""
+    """Markdown (with LaTeX math) -> DOCX (OMML equations) via Pandoc."""
     ensure_pandoc()
     with tempfile.TemporaryDirectory() as td:
         md_path = os.path.join(td, "input.md")
@@ -126,9 +163,8 @@ def md_to_docx(md_text: str) -> bytes:
 
 def pdf_to_docx(pdf_bytes: bytes) -> bytes:
     """
-    PDF -> DOCX (best-effort) qua Pandoc.
-    Lưu ý: khôi phục phương trình thành OMML từ PDF không được đảm bảo 100%,
-    tùy thuộc cấu trúc văn bản của PDF nguồn.
+    PDF -> DOCX (best-effort) via Pandoc.
+    Native equation recovery is not guaranteed for arbitrary PDFs.
     """
     ensure_pandoc()
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmpin:
@@ -142,18 +178,14 @@ def pdf_to_docx(pdf_bytes: bytes) -> bytes:
         subprocess.check_call(cmd)
         with open(out_path, "rb") as f:
             data = f.read()
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
+        try: os.remove(out_path)
+        except Exception: pass
         return data
     finally:
-        try:
-            os.remove(in_path)
-        except Exception:
-            pass
+        try: os.remove(in_path)
+        except Exception: pass
 
-# ====================== MAIN UI ======================
+# ---------- UI blocks ----------
 def page_header():
     st.markdown(f"## {APP_TITLE}")
     st.write("---")
@@ -173,14 +205,11 @@ def word_to_word_ui():
             st.warning("Hãy tải lên một file DOCX trước.")
             return
         try:
-            # Kiểm tra pandoc trước khi xử lý
             ver = ensure_pandoc()
-            st.info(f"Pandoc phát hiện: {ver}")
-
+            st.info(f"Pandoc: {ver}")
             raw = up.read()
             text = extract_text_from_docx(raw)
             md = to_markdown_with_math(text)
-
             header = []
             if title:
                 header.append(f"# {title}\n")
@@ -188,7 +217,6 @@ def word_to_word_ui():
                 header.append(f"**{author}**\n")
             if header:
                 md = "\n".join(header) + "\n" + md
-
             out_bytes = md_to_docx(md)
             st.success("Chuyển đổi thành công.")
             st.download_button(
@@ -204,15 +232,13 @@ def pdf_to_word_ui():
     st.subheader("PDF → DOCX (best-effort)")
     st.write("Dùng Pandoc để trích văn bản; việc khôi phục phương trình thành OMML **không đảm bảo** cho mọi PDF.")
     up = st.file_uploader("Tải lên PDF", type=["pdf"], key="pdf_up")
-
     if st.button("Convert PDF → Word"):
         if not up:
             st.warning("Hãy tải lên một file PDF trước.")
             return
         try:
             ver = ensure_pandoc()
-            st.info(f"Pandoc phát hiện: {ver}")
-
+            st.info(f"Pandoc: {ver}")
             pdf_bytes = up.read()
             out_bytes = pdf_to_docx(pdf_bytes)
             st.success("Chuyển đổi thành công.")
@@ -226,35 +252,25 @@ def pdf_to_word_ui():
             st.error(f"Lỗi: {e}")
 
 def main_app():
-    # Sidebar = Tabs (bên trái)
+    # Sidebar nav (left)
     st.sidebar.markdown(f"### {APP_TITLE}")
     st.sidebar.write("---")
+    nav = st.sidebar.radio("Chức năng", ["Word → Word", "PDF → Word"], index=0)
+    logout_button()  # logout button in sidebar
 
-    nav = st.sidebar.radio(
-        "Chức năng",
-        ["Word → Word", "PDF → Word"],
-        index=0,
-        help="Chọn tác vụ chuyển đổi"
-    )
-
-    # Nút logout trong sidebar
-    logout_button()
-
-    # Header bên phải
+    # Right panel
     page_header()
-
-    # Hiển thị trang theo lựa chọn
     if nav == "Word → Word":
         word_to_word_ui()
     else:
         pdf_to_word_ui()
 
-# ====================== APP ENTRY ======================
+# ---------- Entry ----------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
-    # Chỉ hiển thị login, không hiển thị sidebar/tabs
+    # Only show login (no sidebar/tabs)
     login_view()
 else:
     main_app()
